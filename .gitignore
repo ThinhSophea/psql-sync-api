@@ -1,0 +1,23 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local sync runtime state
+sync_meta.db
+sync_meta.db-*
+db_sync_api.lock
+
+# Generated Graphify output and extraction cache
+graphify-out/
+
+# Local tooling files
+.DS_Store
+
+users.csv
+custome_form_entries (1).csv
