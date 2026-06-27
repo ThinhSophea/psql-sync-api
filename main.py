@@ -231,6 +231,38 @@ def clear_sync_state(meta_conn, scope_key: str):
     meta_conn.commit()
 
 
+def has_sync_state(meta_conn, scope_key: str) -> bool:
+    row = meta_conn.execute(
+        "SELECT 1 FROM sync_state_v2 WHERE scope_key = ? LIMIT 1",
+        (scope_key,),
+    ).fetchone()
+    return row is not None
+
+
+def target_looks_rebuilt(conn, sync_plan: list[dict], meta_conn, scope_key: str) -> bool:
+    """Detect a reset target so a normal one-click sync can safely reload it."""
+    if not has_sync_state(meta_conn, scope_key):
+        return False
+
+    with conn.cursor() as cur:
+        for step in sync_plan:
+            if not step.get("updated_at_col"):
+                continue
+            cur.execute(
+                sql.SQL("SELECT EXISTS (SELECT 1 FROM {} LIMIT 1)").format(
+                    sql.Identifier(step["table"])
+                )
+            )
+            if not cur.fetchone()[0]:
+                logger.warning(
+                    "Target table '%s' is empty while sync cursors exist; treating this run as a full resync",
+                    step["table"],
+                )
+                return True
+
+    return False
+
+
 def sync_scope_key(source_cfg: dict, local_cfg: dict, sync_plan: list[dict]):
     """Stable, non-secret cursor namespace for one source/destination plan."""
     def connection_identity(config: dict):
@@ -261,6 +293,63 @@ def log_run(meta_conn, started_at: datetime, finished_at: datetime, success: boo
         (started_at.isoformat(), finished_at.isoformat(), int(success), json.dumps(summary)),
     )
     meta_conn.commit()
+
+
+def collect_sync_errors(summary: list[dict]) -> list[dict]:
+    errors = []
+    for table_summary in summary:
+        table = table_summary.get("table")
+        for error in table_summary.get("errors", []):
+            errors.append({
+                "code": "ROW_SYNC_FAILED",
+                "table": table,
+                "pk_value": error.get("pk_value"),
+                "message": error.get("error", "Row sync failed"),
+                "details": {
+                    key: value
+                    for key, value in error.items()
+                    if key not in {"pk_value", "error"}
+                },
+            })
+    return errors
+
+
+def sync_response(
+    *,
+    success: bool,
+    mode: str,
+    message: str,
+    summary: Optional[list[dict]] = None,
+    plan: Optional[list[dict]] = None,
+    full_resync: bool = False,
+    auto_full_resync: bool = False,
+):
+    data = {}
+    if summary is not None:
+        data["tables"] = summary
+    if plan is not None:
+        data["plan"] = plan
+
+    errors = collect_sync_errors(summary or [])
+
+    response = {
+        "success": success,
+        "mode": mode,
+        "full_resync": full_resync,
+        "auto_full_resync": auto_full_resync,
+        "message": message,
+        "data": data,
+        "errors": errors,
+    }
+
+    # Backward-compatible fields for existing callers.
+    if summary is not None:
+        response["summary"] = summary
+    if plan is not None:
+        response["dry_run"] = True
+        response["plan"] = plan
+
+    return response
 
 
 def acquire_lock():
@@ -536,12 +625,13 @@ def sync_server_to_local(
                 "where": step["where"],
                 "incremental_column": step["updated_at_col"],
             } for step in sync_plan]
-            return {
-                "success": True,
-                "dry_run": True,
-                "full_resync": full_resync,
-                "plan": summary,
-            }
+            return sync_response(
+                success=True,
+                mode="dry_run",
+                full_resync=full_resync,
+                message="Sync plan generated.",
+                plan=summary,
+            )
 
         try:
             local_conn = psycopg2.connect(**local_cfg, connect_timeout=10)
@@ -552,6 +642,11 @@ def sync_server_to_local(
 
         summary = []
         success = True
+        auto_full_resync = False
+        if not full_resync and target_looks_rebuilt(local_conn, sync_plan, meta_conn, scope_key):
+            full_resync = True
+            auto_full_resync = True
+
         if full_resync:
             clear_sync_state(meta_conn, scope_key)
 
@@ -612,7 +707,22 @@ def sync_server_to_local(
             })
 
         logger.info(f"Sync finished, success={success}, summary={summary}")
-        return {"success": success, "summary": summary}
+        if success:
+            if auto_full_resync:
+                message = "Target looked reset, so a full sync completed automatically."
+            else:
+                message = "Sync completed successfully."
+        else:
+            message = "Sync completed with errors."
+
+        return sync_response(
+            success=success,
+            mode="full_resync" if full_resync else "incremental",
+            full_resync=full_resync,
+            auto_full_resync=auto_full_resync,
+            message=message,
+            summary=summary,
+        )
 
     finally:
         finished_at = datetime.now(timezone.utc)

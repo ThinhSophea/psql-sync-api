@@ -550,6 +550,46 @@ curl --fail-with-body https://sync.example.com/api/sync \
 
 The API uses each table's `updated_at` value and scoped cursor state to fetch only changed rows. It returns `409` if another sync is already running.
 
+For one-click operation, a normal sync also checks whether the target looks rebuilt. If saved cursors exist but a target table in the sync plan is empty, the API automatically clears the saved cursors for that source/target/table plan and treats that run as a full resync. The response includes:
+
+```json
+{
+  "full_resync": true,
+  "auto_full_resync": true
+}
+```
+
+This lets non-technical users press the same sync button after an accidental target reset. A manual `full_resync` is still useful when the target has partial stale data rather than clearly empty tables.
+
+### Sync response contract
+
+`POST /api/sync` returns a consistent wrapper that is easy for another application to integrate:
+
+```json
+{
+  "success": true,
+  "mode": "incremental",
+  "full_resync": false,
+  "auto_full_resync": false,
+  "message": "Sync completed successfully.",
+  "data": {
+    "tables": []
+  },
+  "errors": []
+}
+```
+
+Use these fields in the caller UI:
+
+- `success`: show success or error state after the request finishes
+- `mode`: show whether the run was `dry_run`, `incremental`, or `full_resync`
+- `auto_full_resync`: show a note that the API repaired an empty/reset target automatically
+- `message`: display this directly to non-technical users
+- `data.tables`: table-level fetched/synced/error counts
+- `errors`: machine-readable list for logs, support screens, or admin details
+
+For button UX, disable the sync button and show a spinner while the HTTP request is pending. When the response returns, hide the spinner and display `message`.
+
 Check the recent audit trail:
 
 ```bash
@@ -560,7 +600,7 @@ curl --fail-with-body https://sync.example.com/api/sync/history \
 ## Operating rules
 
 - Run a `dry_run` after production schema migrations, before adding a new selected table, and before a first sync to a new target.
-- Run `full_resync` after recreating the target database, restoring an old backup, or repairing missing records.
+- Run `full_resync` after recreating the target database, restoring an old backup, or repairing missing records. If users only have one sync button, the API auto-promotes normal sync to full resync when it detects empty target tables with existing cursors.
 - Do not run `full_resync` for normal button clicks; it reads and upserts every matching source row and becomes slow for large tables.
 - Back up `/var/lib/db_sync_api/sync_meta.db`. It holds sync cursors and history.
 - Alert on failed runs, repeated `409` responses, source/target connection failures, and tables skipped because a parent failed.
