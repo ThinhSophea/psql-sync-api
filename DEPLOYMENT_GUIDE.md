@@ -16,11 +16,14 @@ The API reads selected tables from the source, discovers their foreign-key paren
 4. Config precedence
 5. VM setup
 6. System service
-7. Subdomain and HTTPS
-8. First sync
-9. Normal incremental sync
-10. Operating rules
-11. Known current limitations
+7. Production updates with Git
+8. Production config updates
+9. Recommended auto deployment
+10. Subdomain and HTTPS
+11. First sync
+12. Normal incremental sync
+13. Operating rules
+14. Known current limitations
 
 ## Recommended hosting model
 
@@ -87,20 +90,19 @@ Run these commands as a sudo-capable administrator.
 ```bash
 sudo apt update
 sudo apt install -y python3 python3-venv python3-pip
-sudo useradd --system --create-home --shell /usr/sbin/nologin dbsync
 sudo mkdir -p /opt/db-sync-api /var/lib/db_sync_api
-sudo chown -R dbsync:dbsync /opt/db-sync-api /var/lib/db_sync_api
+sudo chown -R ubuntu:ubuntu /opt/db-sync-api /var/lib/db_sync_api
 ```
 
 Copy this project to `/opt/db-sync-api`, then install its dependencies:
 
 ```bash
 cd /opt/db-sync-api
-sudo -u dbsync python3 -m venv .venv
-sudo -u dbsync .venv/bin/pip install -r requirements.txt
-sudo -u dbsync cp env.example .env
+sudo -u ubuntu python3 -m venv .venv
+sudo -u ubuntu .venv/bin/pip install -r requirements.txt
+sudo -u ubuntu cp env.example .env
 sudo chmod 600 .env
-sudo chown dbsync:dbsync .env
+sudo chown ubuntu:ubuntu .env
 ```
 
 Edit `.env` and set real values. Keep the API state on persistent disk:
@@ -146,8 +148,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=dbsync
-Group=dbsync
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/opt/db-sync-api
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/db-sync-api/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --workers 1
@@ -172,6 +174,286 @@ sudo journalctl -u db-sync-api -f
 Keep `--workers 1`. The current file lock and SQLite state are designed for one process.
 
 Put Caddy, Nginx, or a cloud load balancer in front of port `8000` to terminate HTTPS. Do not expose `8000` directly to the internet.
+
+## Production updates with Git
+
+Use this for normal production updates when the VM already has the repo checked out at `/opt/db-sync-api`.
+
+SSH to the VM:
+
+```bash
+ssh ubuntu@your-api-vm
+cd /opt/db-sync-api
+```
+
+Back up the production-only files before changing code:
+
+```bash
+sudo cp .env .env.backup.$(date +%Y%m%d-%H%M%S)
+sudo cp /var/lib/db_sync_api/sync_meta.db /var/lib/db_sync_api/sync_meta.db.backup.$(date +%Y%m%d-%H%M%S)
+```
+
+Pull the latest code, update dependencies, and validate the Python entrypoint:
+
+```bash
+sudo -u ubuntu git pull --ff-only
+sudo -u ubuntu .venv/bin/pip install -r requirements.txt
+sudo -u ubuntu .venv/bin/python -m py_compile main.py
+```
+
+Restart and verify the service:
+
+```bash
+sudo systemctl restart db-sync-api
+sudo systemctl status db-sync-api
+curl --fail-with-body http://127.0.0.1:8000/docs
+```
+
+If the service fails, inspect logs:
+
+```bash
+sudo journalctl -u db-sync-api -f
+```
+
+Do not overwrite `.env` during updates. Do not delete `/var/lib/db_sync_api/sync_meta.db` during normal updates; it stores sync cursors and run history.
+
+Nginx or Caddy does not need a reload for normal Python code changes. Reload the reverse proxy only after changing its config.
+
+## Production config updates
+
+Keep production `.env` on the VM. Do not commit it to Git and do not deploy it from GitHub Actions unless you later add a proper secret-management flow.
+
+Use this process when changing database hosts, credentials, SSL mode, the API key, allowed hosts, or sync state paths:
+
+```bash
+ssh ubuntu@your-api-vm
+cd /opt/db-sync-api
+
+sudo cp .env .env.backup.$(date +%Y%m%d-%H%M%S)
+nano .env
+
+sudo systemctl restart db-sync-api
+sudo systemctl status db-sync-api
+curl --fail-with-body http://127.0.0.1:8000/docs
+```
+
+If the service fails after the edit, inspect logs:
+
+```bash
+sudo journalctl -u db-sync-api -f
+```
+
+Common `.env` changes that require a restart:
+
+- `SOURCE_DB_HOST`, `SOURCE_DB_PORT`, `SOURCE_DB_NAME`, `SOURCE_DB_USER`, `SOURCE_DB_PASSWORD`, `SOURCE_DB_SSLMODE`
+- `LOCAL_DB_HOST`, `LOCAL_DB_PORT`, `LOCAL_DB_NAME`, `LOCAL_DB_USER`, `LOCAL_DB_PASSWORD`, `LOCAL_DB_SSLMODE`
+- `SYNC_API_KEY`
+- `ALLOWED_DB_HOSTS`
+- `SYNC_META_DB_PATH`
+- `SYNC_LOCK_FILE`
+
+Recommended production config rules:
+
+- keep code deployment automated, but keep `.env` edits manual on the VM
+- keep `SYNC_META_DB_PATH=/var/lib/db_sync_api/sync_meta.db`
+- keep `SYNC_LOCK_FILE=/var/lib/db_sync_api/db_sync_api.lock`
+- keep `ALLOWED_DB_HOSTS` populated when request-level DB overrides are enabled
+- back up `.env` before every config edit
+- back up `/var/lib/db_sync_api/sync_meta.db` before changing source or target database identity
+
+Changing database host, name, or user can affect sync cursor scope. If you point the API at a new source or target database, run a `dry_run` first. For a new or rebuilt target database, run the first real sync with `full_resync`.
+
+## Recommended auto deployment
+
+Recommended approach: use GitHub Actions to SSH into the single production VM, run `git pull --ff-only`, install dependencies, compile-check `main.py`, restart systemd, and verify `/docs` locally.
+
+This matches the current single-instance design. Avoid auto-deploying to multiple servers until cursor state and locking are moved out of local files.
+
+### One-time VM setup
+
+Create an SSH key for deployment on your local machine:
+
+```bash
+ssh-keygen -t ed25519 -C "db-sync-api-deploy" -f ~/.ssh/db_sync_api_deploy
+```
+
+Add the public key to the VM:
+
+```bash
+ssh-copy-id -i ~/.ssh/db_sync_api_deploy.pub ubuntu@your-api-vm
+```
+
+Make sure the `ubuntu` user can restart only this service without a password:
+
+```bash
+sudo visudo
+```
+
+Add this line:
+
+```text
+ubuntu ALL=(root) NOPASSWD: /bin/systemctl restart db-sync-api
+```
+
+If your server uses `/usr/bin/systemctl`, confirm the path first:
+
+```bash
+command -v systemctl
+```
+
+### GitHub repository secrets
+
+In GitHub, open the repo settings and add these Actions secrets:
+
+```text
+PROD_HOST=your-api-vm-public-ip-or-hostname
+PROD_USER=ubuntu
+PROD_SSH_KEY=contents of ~/.ssh/db_sync_api_deploy
+PROD_APP_DIR=/opt/db-sync-api
+```
+
+### GitHub Actions workflow
+
+Create `.github/workflows/deploy-production.yml`:
+
+```yaml
+name: Deploy production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.PROD_APP_DIR }}"
+
+            cp .env ".env.backup.$(date +%Y%m%d-%H%M%S)"
+            if [ -f /var/lib/db_sync_api/sync_meta.db ]; then
+              cp /var/lib/db_sync_api/sync_meta.db "/var/lib/db_sync_api/sync_meta.db.backup.$(date +%Y%m%d-%H%M%S)"
+            fi
+
+            git fetch origin main
+            git merge --ff-only origin/main
+
+            .venv/bin/pip install -r requirements.txt
+            .venv/bin/python -m py_compile main.py
+
+            sudo systemctl restart db-sync-api
+            systemctl status db-sync-api --no-pager
+            curl --fail-with-body http://127.0.0.1:8000/docs >/dev/null
+```
+
+Use `workflow_dispatch` for manual deploys if you do not want every push to `main` to deploy. For that mode, remove the `push` block.
+
+The workflow intentionally restarts only one VM. It also keeps `.env` and `sync_meta.db` on the VM instead of replacing them from Git.
+
+## EC2 + Nginx path
+
+If you are using EC2, the usual layout is:
+
+```text
+Internet -> Nginx on EC2 :80/:443 -> Uvicorn on 127.0.0.1:8000
+```
+
+Use this when you already see the Nginx welcome page on the domain root. That means Nginx is running, but the request is not yet being proxied to FastAPI.
+
+### Nginx config
+
+Create a site file such as `/etc/nginx/sites-available/db-sync-api`:
+
+```nginx
+server {
+    listen 80;
+    server_name db-sync-api.vanny.monster;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Then enable it and remove the default site:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/db-sync-api /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+If `http://db-sync-api.vanny.monster/` still shows the Nginx welcome page, check:
+
+- `server_name` matches the domain exactly
+- the default Nginx site is disabled
+- `proxy_pass` points to `127.0.0.1:8000`
+- `curl http://127.0.0.1:8000/docs` works on the EC2 instance
+
+### Verify the app locally
+
+Run these from the EC2 instance:
+
+```bash
+curl http://127.0.0.1:8000/docs
+curl http://127.0.0.1:8000/openapi.json
+```
+
+If those work locally but the public domain does not, the issue is Nginx or DNS, not FastAPI.
+
+### Add HTTPS with Certbot
+
+After the HTTP proxy works, install Certbot and issue a certificate:
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d db-sync-api.vanny.monster
+```
+
+Certbot updates the Nginx config and adds the TLS server block. After that, test:
+
+```bash
+curl -I https://db-sync-api.vanny.monster/docs
+```
+
+If renewal is enabled through the package, keep port `80` reachable for certificate renewal.
+
+### If you use Cloudflare
+
+Use Cloudflare only for the API domain, not for PostgreSQL.
+
+Recommended settings:
+
+- DNS record: proxy enabled only after the origin HTTPS certificate is working
+- SSL/TLS mode: `Full (strict)`
+- Do not use `Flexible`
+
+If Cloudflare proxies the API, the request path becomes:
+
+```text
+Browser -> Cloudflare -> Nginx on EC2 -> Uvicorn
+```
+
+Keep the origin server still serving valid HTTPS. Cloudflare is an edge proxy, not a replacement for origin TLS.
 
 ## Subdomain and HTTPS
 

@@ -1,0 +1,41 @@
+name: Deploy production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.PROD_APP_DIR }}"
+
+            cp .env ".env.backup.$(date +%Y%m%d-%H%M%S)"
+            if [ -f /var/lib/db_sync_api/sync_meta.db ]; then
+              cp /var/lib/db_sync_api/sync_meta.db "/var/lib/db_sync_api/sync_meta.db.backup.$(date +%Y%m%d-%H%M%S)"
+            fi
+
+            git fetch origin main
+            git merge --ff-only origin/main
+
+            .venv/bin/pip install -r requirements.txt
+            .venv/bin/python -m py_compile main.py
+
+            sudo systemctl restart db-sync-api
+            systemctl status db-sync-api --no-pager
+            curl --fail-with-body http://127.0.0.1:8000/docs >/dev/null
