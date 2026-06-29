@@ -172,9 +172,6 @@ class SyncResponse(BaseModel):
     message: str
     data: SyncResponseData
     errors: list[SyncErrorItem]
-    summary: Optional[list[dict[str, Any]]] = None
-    dry_run: Optional[bool] = None
-    plan: Optional[list[dict[str, Any]]] = None
 
 
 # --- lightweight embedded state, separate from both Postgres databases ---
@@ -372,13 +369,6 @@ def sync_response(
         "data": data,
         "errors": errors,
     }
-
-    # Backward-compatible fields for existing callers.
-    if summary is not None:
-        response["summary"] = summary
-    if plan is not None:
-        response["dry_run"] = True
-        response["plan"] = plan
 
     return response
 
@@ -775,6 +765,8 @@ def sync_server_to_local(
         if success:
             if auto_full_resync:
                 message = "Target looked reset, so a full sync completed automatically."
+            elif sum(table.get("synced", 0) for table in summary) == 0:
+                message = "No new or changed data to sync."
             else:
                 message = "Sync completed successfully."
         else:

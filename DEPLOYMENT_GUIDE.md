@@ -46,6 +46,55 @@ Use the cloud provider already hosting the target database when possible:
 
 Assign the API VM a stable outbound IP. The source PostgreSQL firewall should allow port `5432` only from that IP.
 
+### Standalone API VPS topology
+
+The API can also be deployed on its own VPS, separate from both application/database servers:
+
+```text
+Source VPS PostgreSQL  ->  Sync API VPS  ->  Target VPS PostgreSQL
+```
+
+This topology works when both database servers allow PostgreSQL connections from the Sync API VPS IP.
+
+Source VPS requirements:
+
+- PostgreSQL listens on a private hostname/IP when available, otherwise a locked-down public IP.
+- Firewall allows port `5432` only from the Sync API VPS IP.
+- `pg_hba.conf` allows the Sync API VPS IP.
+- The source sync role has `CONNECT`, schema `USAGE`, and `SELECT`.
+
+Target VPS requirements:
+
+- PostgreSQL listens on a private hostname/IP when available, otherwise a locked-down public IP.
+- Firewall allows port `5432` only from the Sync API VPS IP.
+- `pg_hba.conf` allows the Sync API VPS IP.
+- The target sync role has `CONNECT`, schema `USAGE`, `SELECT`, `INSERT`, and `UPDATE`.
+
+Example `.env` on the standalone Sync API VPS:
+
+```dotenv
+SOURCE_DB_HOST=source-vps-ip-or-private-hostname
+SOURCE_DB_PORT=5432
+SOURCE_DB_NAME=source_db
+SOURCE_DB_USER=sync_reader
+SOURCE_DB_PASSWORD=replace-with-a-secret
+SOURCE_DB_SSLMODE=require
+
+LOCAL_DB_HOST=target-vps-ip-or-private-hostname
+LOCAL_DB_PORT=5432
+LOCAL_DB_NAME=target_db
+LOCAL_DB_USER=sync_writer
+LOCAL_DB_PASSWORD=replace-with-a-secret
+LOCAL_DB_SSLMODE=require
+
+SYNC_META_DB_PATH=/var/lib/db_sync_api/sync_meta.db
+SYNC_LOCK_FILE=/tmp/db_sync_api.lock
+SYNC_API_KEY=replace-with-a-secret-api-key
+ALLOWED_DB_HOSTS=source-vps-ip-or-private-hostname,target-vps-ip-or-private-hostname
+```
+
+If the API VPS connects over public internet, keep `sslmode=require` and restrict both database firewalls to only the Sync API VPS IP. The calling Laravel/application server should call only the HTTPS API endpoint; it should not receive database credentials or connect directly to either database.
+
 ## Network and security rules
 
 Apply these rules before deploying:
@@ -628,7 +677,7 @@ This lets non-technical users press the same sync button after an accidental tar
   "mode": "incremental",
   "full_resync": false,
   "auto_full_resync": false,
-  "message": "Sync completed successfully.",
+  "message": "No new or changed data to sync.",
   "data": {
     "tables": []
   },
